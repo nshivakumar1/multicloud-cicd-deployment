@@ -210,7 +210,7 @@ pipeline {
         
         stage('Post-Deploy Tests') {
             when {
-                not { params.DESTROY_INFRASTRUCTURE }
+                expression { params.DESTROY_INFRASTRUCTURE == false }
             }
             steps {
                 dir('terraform') {
