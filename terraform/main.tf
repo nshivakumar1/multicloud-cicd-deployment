@@ -18,11 +18,7 @@ terraform {
     }
   }
   
-  backend "s3" {
-    bucket = "multicloud-terraform-state-bucket-unique-12345"
-    key    = "multicloud-cicd/terraform.tfstate"
-    region = "us-east-1"
-  }
+  # Backend configuration is in backend.tf - do not duplicate here
 }
 
 # Configure AWS Provider
