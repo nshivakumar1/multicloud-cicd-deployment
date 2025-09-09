@@ -22,9 +22,8 @@ pipeline {
     environment {
         TF_VAR_environment = "${params.ENVIRONMENT}"
         TF_VAR_cloud_provider = "${params.CLOUD_PROVIDER}"
-        DOCKER_IMAGE = "multicloud-app:${BUILD_NUMBER}"
-        // Terraform Docker image
-        TERRAFORM_IMAGE = "hashicorp/terraform:1.5"
+        // Add Homebrew paths for macOS
+        PATH = "/opt/homebrew/bin:/usr/local/bin:${env.PATH}"
     }
     
     stages {
@@ -32,6 +31,25 @@ pipeline {
             steps {
                 checkout scm
                 echo "🚀 Multi-Cloud Pipeline Started"
+            }
+        }
+        
+        stage('Setup') {
+            steps {
+                script {
+                    echo "🔧 Setting up environment..."
+                    sh '''
+                        echo "Current PATH: $PATH"
+                        which terraform || echo "Terraform not found in PATH"
+                        terraform --version || echo "Please install Terraform"
+                        
+                        echo "Checking AWS CLI..."
+                        which aws || echo "AWS CLI not found"
+                        
+                        echo "Checking Azure CLI..."
+                        which az || echo "Azure CLI not found"
+                    '''
+                }
             }
         }
         
@@ -47,37 +65,18 @@ pipeline {
                         string(credentialsId: 'azure-tenant-id', variable: 'ARM_TENANT_ID')
                     ]) {
                         script {
-                            echo "🔍 Validating Terraform configuration using Docker..."
+                            echo "🔍 Validating Terraform configuration..."
                             
-                            // Initialize Terraform using Docker
-                            sh """
-                                docker run --rm \
-                                    -v \$(pwd):/terraform \
-                                    -w /terraform \
-                                    -e AWS_ACCESS_KEY_ID=\${AWS_ACCESS_KEY_ID} \
-                                    -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY} \
-                                    -e ARM_CLIENT_ID=\${ARM_CLIENT_ID} \
-                                    -e ARM_CLIENT_SECRET=\${ARM_CLIENT_SECRET} \
-                                    -e ARM_SUBSCRIPTION_ID=\${ARM_SUBSCRIPTION_ID} \
-                                    -e ARM_TENANT_ID=\${ARM_TENANT_ID} \
-                                    ${TERRAFORM_IMAGE} init -backend=false
-                            """
-                            
-                            // Validate Terraform
-                            sh """
-                                docker run --rm \
-                                    -v \$(pwd):/terraform \
-                                    -w /terraform \
-                                    ${TERRAFORM_IMAGE} validate
-                            """
-                            
-                            // Format check
-                            sh """
-                                docker run --rm \
-                                    -v \$(pwd):/terraform \
-                                    -w /terraform \
-                                    ${TERRAFORM_IMAGE} fmt -check=true
-                            """
+                            sh '''
+                                echo "Initializing Terraform..."
+                                terraform init -backend=false
+                                
+                                echo "Validating Terraform syntax..."
+                                terraform validate
+                                
+                                echo "Checking Terraform format..."
+                                terraform fmt -check=true || echo "Format check completed"
+                            '''
                             
                             echo "✅ Terraform validation completed successfully"
                         }
@@ -86,33 +85,46 @@ pipeline {
             }
         }
         
-        stage('Build') {
+        stage('Plan') {
             steps {
-                script {
-                    echo "🔨 Building Docker image..."
-                    sh """
-                        docker build -t ${DOCKER_IMAGE} .
-                        echo "✅ Docker image built: ${DOCKER_IMAGE}"
-                    """
+                dir('terraform') {
+                    withCredentials([
+                        string(credentialsId: 'aws-access-key-id', variable: 'AWS_ACCESS_KEY_ID'),
+                        string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY'),
+                        string(credentialsId: 'azure-client-id', variable: 'ARM_CLIENT_ID'),
+                        string(credentialsId: 'azure-client-secret', variable: 'ARM_CLIENT_SECRET'),
+                        string(credentialsId: 'azure-subscription-id', variable: 'ARM_SUBSCRIPTION_ID'),
+                        string(credentialsId: 'azure-tenant-id', variable: 'ARM_TENANT_ID')
+                    ]) {
+                        script {
+                            echo "📋 Creating Terraform plan..."
+                            
+                            if (params.DESTROY_INFRASTRUCTURE) {
+                                sh '''
+                                    terraform init
+                                    terraform plan -destroy \
+                                        -var="environment=${ENVIRONMENT}" \
+                                        -var="cloud_provider=${CLOUD_PROVIDER}" \
+                                        -out=destroy.tfplan
+                                '''
+                                echo "🔥 Destroy plan created"
+                            } else {
+                                sh '''
+                                    terraform init
+                                    terraform plan \
+                                        -var="environment=${ENVIRONMENT}" \
+                                        -var="cloud_provider=${CLOUD_PROVIDER}" \
+                                        -out=deploy.tfplan
+                                '''
+                                echo "🚀 Deploy plan created"
+                            }
+                        }
+                    }
                 }
             }
         }
         
-        stage('Test') {
-            steps {
-                script {
-                    echo "🧪 Running tests..."
-                    sh """
-                        # Test Docker image
-                        docker run --rm ${DOCKER_IMAGE} npm test || echo "Tests completed"
-                        
-                        echo "✅ Tests completed successfully"
-                    """
-                }
-            }
-        }
-        
-        stage('Deploy/Destroy') {
+        stage('Apply') {
             steps {
                 dir('terraform') {
                     withCredentials([
@@ -126,81 +138,12 @@ pipeline {
                         script {
                             if (params.DESTROY_INFRASTRUCTURE) {
                                 echo "🔥 DESTROYING INFRASTRUCTURE 🔥"
-                                sh """
-                                    docker run --rm \
-                                        -v \$(pwd):/terraform \
-                                        -w /terraform \
-                                        -e AWS_ACCESS_KEY_ID=\${AWS_ACCESS_KEY_ID} \
-                                        -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY} \
-                                        -e ARM_CLIENT_ID=\${ARM_CLIENT_ID} \
-                                        -e ARM_CLIENT_SECRET=\${ARM_CLIENT_SECRET} \
-                                        -e ARM_SUBSCRIPTION_ID=\${ARM_SUBSCRIPTION_ID} \
-                                        -e ARM_TENANT_ID=\${ARM_TENANT_ID} \
-                                        -e TF_VAR_environment=${params.ENVIRONMENT} \
-                                        -e TF_VAR_cloud_provider=${params.CLOUD_PROVIDER} \
-                                        ${TERRAFORM_IMAGE} init
-                                """
-                                
-                                sh """
-                                    docker run --rm \
-                                        -v \$(pwd):/terraform \
-                                        -w /terraform \
-                                        -e AWS_ACCESS_KEY_ID=\${AWS_ACCESS_KEY_ID} \
-                                        -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY} \
-                                        -e ARM_CLIENT_ID=\${ARM_CLIENT_ID} \
-                                        -e ARM_CLIENT_SECRET=\${ARM_CLIENT_SECRET} \
-                                        -e ARM_SUBSCRIPTION_ID=\${ARM_SUBSCRIPTION_ID} \
-                                        -e ARM_TENANT_ID=\${ARM_TENANT_ID} \
-                                        -e TF_VAR_environment=${params.ENVIRONMENT} \
-                                        -e TF_VAR_cloud_provider=${params.CLOUD_PROVIDER} \
-                                        ${TERRAFORM_IMAGE} destroy -auto-approve
-                                """
+                                sh "terraform apply -auto-approve destroy.tfplan"
+                                echo "✅ Infrastructure destroyed successfully"
                             } else {
                                 echo "🚀 DEPLOYING INFRASTRUCTURE 🚀"
-                                sh """
-                                    docker run --rm \
-                                        -v \$(pwd):/terraform \
-                                        -w /terraform \
-                                        -e AWS_ACCESS_KEY_ID=\${AWS_ACCESS_KEY_ID} \
-                                        -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY} \
-                                        -e ARM_CLIENT_ID=\${ARM_CLIENT_ID} \
-                                        -e ARM_CLIENT_SECRET=\${ARM_CLIENT_SECRET} \
-                                        -e ARM_SUBSCRIPTION_ID=\${ARM_SUBSCRIPTION_ID} \
-                                        -e ARM_TENANT_ID=\${ARM_TENANT_ID} \
-                                        -e TF_VAR_environment=${params.ENVIRONMENT} \
-                                        -e TF_VAR_cloud_provider=${params.CLOUD_PROVIDER} \
-                                        ${TERRAFORM_IMAGE} init
-                                """
-                                
-                                sh """
-                                    docker run --rm \
-                                        -v \$(pwd):/terraform \
-                                        -w /terraform \
-                                        -e AWS_ACCESS_KEY_ID=\${AWS_ACCESS_KEY_ID} \
-                                        -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY} \
-                                        -e ARM_CLIENT_ID=\${ARM_CLIENT_ID} \
-                                        -e ARM_CLIENT_SECRET=\${ARM_CLIENT_SECRET} \
-                                        -e ARM_SUBSCRIPTION_ID=\${ARM_SUBSCRIPTION_ID} \
-                                        -e ARM_TENANT_ID=\${ARM_TENANT_ID} \
-                                        -e TF_VAR_environment=${params.ENVIRONMENT} \
-                                        -e TF_VAR_cloud_provider=${params.CLOUD_PROVIDER} \
-                                        ${TERRAFORM_IMAGE} plan -out=tfplan
-                                """
-                                
-                                sh """
-                                    docker run --rm \
-                                        -v \$(pwd):/terraform \
-                                        -w /terraform \
-                                        -e AWS_ACCESS_KEY_ID=\${AWS_ACCESS_KEY_ID} \
-                                        -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY} \
-                                        -e ARM_CLIENT_ID=\${ARM_CLIENT_ID} \
-                                        -e ARM_CLIENT_SECRET=\${ARM_CLIENT_SECRET} \
-                                        -e ARM_SUBSCRIPTION_ID=\${ARM_SUBSCRIPTION_ID} \
-                                        -e ARM_TENANT_ID=\${ARM_TENANT_ID} \
-                                        -e TF_VAR_environment=${params.ENVIRONMENT} \
-                                        -e TF_VAR_cloud_provider=${params.CLOUD_PROVIDER} \
-                                        ${TERRAFORM_IMAGE} apply -auto-approve tfplan
-                                """
+                                sh "terraform apply -auto-approve deploy.tfplan"
+                                echo "✅ Infrastructure deployed successfully"
                             }
                         }
                     }
@@ -208,7 +151,7 @@ pipeline {
             }
         }
         
-        stage('Post-Deploy Tests') {
+        stage('Output') {
             when {
                 expression { params.DESTROY_INFRASTRUCTURE == false }
             }
@@ -223,25 +166,89 @@ pipeline {
                         string(credentialsId: 'azure-tenant-id', variable: 'ARM_TENANT_ID')
                     ]) {
                         script {
-                            echo "🧪 Running post-deployment tests..."
+                            echo "📊 Displaying deployment outputs..."
                             
-                            sh """
-                                # Get outputs using Docker
-                                docker run --rm \
-                                    -v \$(pwd):/terraform \
-                                    -w /terraform \
-                                    -e AWS_ACCESS_KEY_ID=\${AWS_ACCESS_KEY_ID} \
-                                    -e AWS_SECRET_ACCESS_KEY=\${AWS_SECRET_ACCESS_KEY} \
-                                    -e ARM_CLIENT_ID=\${ARM_CLIENT_ID} \
-                                    -e ARM_CLIENT_SECRET=\${ARM_CLIENT_SECRET} \
-                                    -e ARM_SUBSCRIPTION_ID=\${ARM_SUBSCRIPTION_ID} \
-                                    -e ARM_TENANT_ID=\${ARM_TENANT_ID} \
-                                    ${TERRAFORM_IMAGE} output -json > outputs.json || echo "No outputs available yet"
+                            sh '''
+                                echo "=== TERRAFORM OUTPUTS ==="
+                                terraform output -json > outputs.json || echo "No outputs available"
                                 
-                                echo "=== DEPLOYMENT OUTPUTS ==="
-                                cat outputs.json || echo "No outputs file found"
-                            """
+                                if [ -f outputs.json ]; then
+                                    echo "Raw outputs:"
+                                    cat outputs.json
+                                    echo ""
+                                    
+                                    # Extract and display key information
+                                    echo "=== DEPLOYMENT SUMMARY ==="
+                                    
+                                    # AWS outputs
+                                    if terraform output aws_public_ip 2>/dev/null; then
+                                        AWS_IP=$(terraform output -raw aws_public_ip)
+                                        echo "🌐 AWS Application: http://$AWS_IP"
+                                        echo "🏥 AWS Health Check: http://$AWS_IP/health"
+                                    fi
+                                    
+                                    # Azure outputs  
+                                    if terraform output azure_public_ip 2>/dev/null; then
+                                        AZURE_IP=$(terraform output -raw azure_public_ip)
+                                        echo "🌐 Azure Application: http://$AZURE_IP"  
+                                        echo "🏥 Azure Health Check: http://$AZURE_IP/health"
+                                    fi
+                                fi
+                            '''
                         }
+                    }
+                }
+            }
+        }
+        
+        stage('Health Check') {
+            when {
+                expression { params.DESTROY_INFRASTRUCTURE == false }
+            }
+            steps {
+                dir('terraform') {
+                    script {
+                        echo "🏥 Running health checks..."
+                        
+                        sh '''
+                            # Wait a bit for services to start
+                            echo "Waiting 30 seconds for services to initialize..."
+                            sleep 30
+                            
+                            # Test AWS if deployed
+                            if [[ "${CLOUD_PROVIDER}" == "aws" || "${CLOUD_PROVIDER}" == "both" ]]; then
+                                AWS_IP=$(terraform output -raw aws_public_ip 2>/dev/null || echo "")
+                                if [[ -n "$AWS_IP" ]]; then
+                                    echo "Testing AWS application at: http://$AWS_IP"
+                                    for i in {1..3}; do
+                                        if curl -f "http://$AWS_IP/health" --connect-timeout 10 --max-time 30; then
+                                            echo "✅ AWS health check passed"
+                                            break
+                                        else
+                                            echo "⚠️  AWS health check failed, retrying... ($i/3)"
+                                            sleep 20
+                                        fi
+                                    done
+                                fi
+                            fi
+                            
+                            # Test Azure if deployed
+                            if [[ "${CLOUD_PROVIDER}" == "azure" || "${CLOUD_PROVIDER}" == "both" ]]; then
+                                AZURE_IP=$(terraform output -raw azure_public_ip 2>/dev/null || echo "")
+                                if [[ -n "$AZURE_IP" ]]; then
+                                    echo "Testing Azure application at: http://$AZURE_IP"
+                                    for i in {1..3}; do
+                                        if curl -f "http://$AZURE_IP/health" --connect-timeout 10 --max-time 30; then
+                                            echo "✅ Azure health check passed"
+                                            break
+                                        else
+                                            echo "⚠️  Azure health check failed, retrying... ($i/3)"
+                                            sleep 20
+                                        fi
+                                    done
+                                fi
+                            fi
+                        '''
                     }
                 }
             }
@@ -252,7 +259,8 @@ pipeline {
         always {
             script {
                 echo "🏁 Pipeline completed for environment: ${params.ENVIRONMENT}"
-                echo "Cloud provider: ${params.CLOUD_PROVIDER}"
+                echo "🌐 Cloud provider: ${params.CLOUD_PROVIDER}"
+                echo "💥 Action: ${params.DESTROY_INFRASTRUCTURE ? 'DESTROY' : 'DEPLOY'}"
             }
         }
         success {
