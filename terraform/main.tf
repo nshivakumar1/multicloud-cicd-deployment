@@ -1,5 +1,8 @@
+# terraform/main.tf
+
 terraform {
   required_version = ">= 1.0"
+  
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -9,167 +12,266 @@ terraform {
       source  = "hashicorp/azurerm"
       version = "~> 3.0"
     }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.1"
+    }
+  }
+  
+  backend "s3" {
+    bucket = "multicloud-terraform-state-bucket-unique-12345"
+    key    = "multicloud-cicd/terraform.tfstate"
+    region = "us-east-1"
   }
 }
 
+# Configure AWS Provider
 provider "aws" {
-  region = var.aws_region
+  region = var.region
+  
+  default_tags {
+    tags = merge(var.tags, {
+      Environment = var.environment
+    })
+  }
 }
 
+# Configure Azure Provider
 provider "azurerm" {
   features {}
 }
 
+# Random suffix for unique resource names
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
+# Local values for conditional deployment
+locals {
+  deploy_aws   = var.cloud_provider == "aws" || var.cloud_provider == "both"
+  deploy_azure = var.cloud_provider == "azure" || var.cloud_provider == "both"
+  
+  common_tags = merge(var.tags, {
+    Environment = var.environment
+    Deployment  = var.cloud_provider
+  })
+}
+
+# Data source for SSH public key
+data "local_file" "ssh_public_key" {
+  filename = pathexpand(var.ssh_public_key_path)
+}
+
+# ================================
+# AWS Resources
+# ================================
+
 # AWS VPC
 resource "aws_vpc" "main" {
+  count = local.deploy_aws ? 1 : 0
+  
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
-  tags = {
-    Name        = "${var.app_name}-vpc"
-    Environment = var.environment
-  }
+  
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-vpc-${var.environment}"
+  })
 }
 
+# AWS Internet Gateway
 resource "aws_internet_gateway" "main" {
-  vpc_id = aws_vpc.main.id
-  tags = {
-    Name        = "${var.app_name}-igw"
-    Environment = var.environment
-  }
+  count = local.deploy_aws ? 1 : 0
+  
+  vpc_id = aws_vpc.main[0].id
+  
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-igw-${var.environment}"
+  })
 }
 
+# AWS Public Subnet
 resource "aws_subnet" "public" {
-  vpc_id                  = aws_vpc.main.id
+  count = local.deploy_aws ? 1 : 0
+  
+  vpc_id                  = aws_vpc.main[0].id
   cidr_block              = "10.0.1.0/24"
-  availability_zone       = data.aws_availability_zones.available.names[0]
+  availability_zone       = data.aws_availability_zones.available[0].names[0]
   map_public_ip_on_launch = true
-  tags = {
-    Name        = "${var.app_name}-public-subnet"
-    Environment = var.environment
-  }
+  
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-public-subnet-${var.environment}"
+  })
 }
 
+# AWS Availability Zones data
+data "aws_availability_zones" "available" {
+  count = local.deploy_aws ? 1 : 0
+  state = "available"
+}
+
+# AWS Route Table
 resource "aws_route_table" "public" {
-  vpc_id = aws_vpc.main.id
+  count = local.deploy_aws ? 1 : 0
+  
+  vpc_id = aws_vpc.main[0].id
+  
   route {
     cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.main.id
+    gateway_id = aws_internet_gateway.main[0].id
   }
-  tags = {
-    Name        = "${var.app_name}-public-rt"
-    Environment = var.environment
-  }
+  
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-public-rt-${var.environment}"
+  })
 }
 
+# AWS Route Table Association
 resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
-  route_table_id = aws_route_table.public.id
+  count = local.deploy_aws ? 1 : 0
+  
+  subnet_id      = aws_subnet.public[0].id
+  route_table_id = aws_route_table.public[0].id
 }
 
-resource "aws_security_group" "app" {
-  name_prefix = "${var.app_name}-"
-  vpc_id      = aws_vpc.main.id
-
+# AWS Security Group
+resource "aws_security_group" "web" {
+  count = local.deploy_aws ? 1 : 0
+  
+  name        = "${var.project_name}-web-sg-${var.environment}"
+  description = "Security group for web application"
+  vpc_id      = aws_vpc.main[0].id
+  
   ingress {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = var.allowed_ips
+    cidr_blocks = var.allowed_cidr_blocks
   }
-
+  
   ingress {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = var.allowed_ips
+    cidr_blocks = var.allowed_cidr_blocks
   }
-
+  
   egress {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+  
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-web-sg-${var.environment}"
+  })
+}
 
-  tags = {
-    Name        = "${var.app_name}-sg"
-    Environment = var.environment
+# AWS Key Pair
+resource "aws_key_pair" "main" {
+  count = local.deploy_aws ? 1 : 0
+  
+  key_name   = "${var.project_name}-key-${var.environment}"
+  public_key = data.local_file.ssh_public_key.content
+  
+  tags = local.common_tags
+}
+
+# AWS AMI data
+data "aws_ami" "ubuntu" {
+  count = local.deploy_aws ? 1 : 0
+  
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+  
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+  
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
   }
 }
 
-resource "aws_key_pair" "app" {
-  key_name   = "${var.app_name}-key"
-  public_key = file("~/.ssh/id_rsa.pub")
-}
-
-resource "aws_instance" "app" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.aws_instance_type
-  subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.app.id]
-  key_name               = aws_key_pair.app.key_name
-
-  user_data = base64encode(templatefile("${path.module}/../scripts/aws-user-data.sh", {
-    app_name = var.app_name
+# AWS EC2 Instance
+resource "aws_instance" "web" {
+  count = local.deploy_aws ? 1 : 0
+  
+  ami                    = data.aws_ami.ubuntu[0].id
+  instance_type          = var.instance_type
+  key_name               = aws_key_pair.main[0].key_name
+  vpc_security_group_ids = [aws_security_group.web[0].id]
+  subnet_id              = aws_subnet.public[0].id
+  
+  user_data = base64encode(templatefile("${path.module}/scripts/user-data.sh", {
+    app_port = var.app_port
   }))
-
-  tags = {
-    Name        = "${var.app_name}-aws-instance"
-    Environment = var.environment
-    Cloud       = "AWS"
-  }
+  
+  tags = merge(local.common_tags, {
+    Name = "${var.project_name}-web-${var.environment}"
+  })
 }
 
-resource "aws_s3_bucket" "app" {
-  bucket = "${var.app_name}-${var.environment}-${random_string.bucket_suffix.result}"
-  tags = {
-    Name        = "${var.app_name}-bucket"
-    Environment = var.environment
-  }
-}
-
-resource "aws_s3_bucket_public_access_block" "app" {
-  bucket = aws_s3_bucket.app.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
-}
-
+# ================================
 # Azure Resources
+# ================================
+
+# Azure Resource Group
 resource "azurerm_resource_group" "main" {
-  name     = "${var.app_name}-${var.environment}-rg"
-  location = var.azure_region
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-  }
+  count = local.deploy_azure ? 1 : 0
+  
+  name     = "${var.project_name}-rg-${var.environment}"
+  location = var.azure_location
+  
+  tags = local.common_tags
 }
 
+# Azure Virtual Network
 resource "azurerm_virtual_network" "main" {
-  name                = "${var.app_name}-vnet"
+  count = local.deploy_azure ? 1 : 0
+  
+  name                = "${var.project_name}-vnet-${var.environment}"
   address_space       = ["10.1.0.0/16"]
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-  }
+  location            = azurerm_resource_group.main[0].location
+  resource_group_name = azurerm_resource_group.main[0].name
+  
+  tags = local.common_tags
 }
 
-resource "azurerm_subnet" "internal" {
-  name                 = "internal"
-  resource_group_name  = azurerm_resource_group.main.name
-  virtual_network_name = azurerm_virtual_network.main.name
-  address_prefixes     = ["10.1.2.0/24"]
+# Azure Subnet
+resource "azurerm_subnet" "public" {
+  count = local.deploy_azure ? 1 : 0
+  
+  name                 = "${var.project_name}-subnet-${var.environment}"
+  resource_group_name  = azurerm_resource_group.main[0].name
+  virtual_network_name = azurerm_virtual_network.main[0].name
+  address_prefixes     = ["10.1.1.0/24"]
 }
 
+# Azure Public IP
+resource "azurerm_public_ip" "main" {
+  count = local.deploy_azure ? 1 : 0
+  
+  name                = "${var.project_name}-pip-${var.environment}"
+  location            = azurerm_resource_group.main[0].location
+  resource_group_name = azurerm_resource_group.main[0].name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  
+  tags = local.common_tags
+}
+
+# Azure Network Security Group
 resource "azurerm_network_security_group" "main" {
-  name                = "${var.app_name}-nsg"
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
-
+  count = local.deploy_azure ? 1 : 0
+  
+  name                = "${var.project_name}-nsg-${var.environment}"
+  location            = azurerm_resource_group.main[0].location
+  resource_group_name = azurerm_resource_group.main[0].name
+  
   security_rule {
     name                       = "HTTP"
     priority                   = 1001
@@ -181,7 +283,7 @@ resource "azurerm_network_security_group" "main" {
     source_address_prefix      = "*"
     destination_address_prefix = "*"
   }
-
+  
   security_rule {
     name                       = "SSH"
     priority                   = 1002
@@ -193,121 +295,72 @@ resource "azurerm_network_security_group" "main" {
     source_address_prefix      = "*"
     destination_address_prefix = "*"
   }
-
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-  }
+  
+  tags = local.common_tags
 }
 
-resource "azurerm_public_ip" "main" {
-  name                = "${var.app_name}-public-ip"
-  resource_group_name = azurerm_resource_group.main.name
-  location            = azurerm_resource_group.main.location
-  allocation_method   = "Static"
-  sku                 = "Standard"
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-  }
-}
-
+# Azure Network Interface
 resource "azurerm_network_interface" "main" {
-  name                = "${var.app_name}-nic"
-  location            = azurerm_resource_group.main.location
-  resource_group_name = azurerm_resource_group.main.name
-
+  count = local.deploy_azure ? 1 : 0
+  
+  name                = "${var.project_name}-nic-${var.environment}"
+  location            = azurerm_resource_group.main[0].location
+  resource_group_name = azurerm_resource_group.main[0].name
+  
   ip_configuration {
-    name                          = "testconfiguration1"
-    subnet_id                     = azurerm_subnet.internal.id
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.public[0].id
     private_ip_address_allocation = "Dynamic"
-    public_ip_address_id          = azurerm_public_ip.main.id
+    public_ip_address_id          = azurerm_public_ip.main[0].id
   }
-
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-  }
+  
+  tags = local.common_tags
 }
 
+# Azure Network Security Group Association
 resource "azurerm_network_interface_security_group_association" "main" {
-  network_interface_id      = azurerm_network_interface.main.id
-  network_security_group_id = azurerm_network_security_group.main.id
+  count = local.deploy_azure ? 1 : 0
+  
+  network_interface_id      = azurerm_network_interface.main[0].id
+  network_security_group_id = azurerm_network_security_group.main[0].id
 }
 
+# Azure Virtual Machine
 resource "azurerm_linux_virtual_machine" "main" {
-  name                = "${var.app_name}-vm"
-  resource_group_name = azurerm_resource_group.main.name
-  location            = azurerm_resource_group.main.location
-  size                = var.azure_vm_size
+  count = local.deploy_azure ? 1 : 0
+  
+  name                = "${var.project_name}-vm-${var.environment}"
+  location            = azurerm_resource_group.main[0].location
+  resource_group_name = azurerm_resource_group.main[0].name
+  size                = var.vm_size
   admin_username      = "adminuser"
-
+  
   disable_password_authentication = true
-
+  
   network_interface_ids = [
-    azurerm_network_interface.main.id,
+    azurerm_network_interface.main[0].id,
   ]
-
+  
   admin_ssh_key {
     username   = "adminuser"
-    public_key = file("~/.ssh/id_rsa.pub")
+    public_key = data.local_file.ssh_public_key.content
   }
-
+  
   os_disk {
     caching              = "ReadWrite"
     storage_account_type = "Standard_LRS"
   }
-
+  
   source_image_reference {
     publisher = "Canonical"
     offer     = "0001-com-ubuntu-server-jammy"
-    sku       = "22_04-lts"
+    sku       = "22_04-lts-gen2"
     version   = "latest"
   }
-
-  custom_data = base64encode(templatefile("${path.module}/../scripts/azure-user-data.sh", {
-    app_name = var.app_name
+  
+  custom_data = base64encode(templatefile("${path.module}/scripts/user-data.sh", {
+    app_port = var.app_port
   }))
-
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-    Cloud       = "Azure"
-  }
-}
-
-resource "azurerm_storage_account" "main" {
-  name                     = "mc${var.environment}${random_string.bucket_suffix.result}"
-  resource_group_name      = azurerm_resource_group.main.name
-  location                 = azurerm_resource_group.main.location
-  account_tier             = "Standard"
-  account_replication_type = "LRS"
-  tags = {
-    Environment = var.environment
-    Application = var.app_name
-  }
-}
-
-# Data sources
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"]
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
-  }
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-}
-
-resource "random_string" "bucket_suffix" {
-  length  = 8
-  special = false
-  upper   = false
+  
+  tags = local.common_tags
 }
